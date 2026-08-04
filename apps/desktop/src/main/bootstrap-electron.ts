@@ -224,7 +224,6 @@ import {
 } from './cindy-media/cindyMediaProtocol';
 import * as cindyMediaBlobStore from './cindy-media/blobStore';
 import * as cindyChatAttachments from './cindy-media/chatAttachments';
-import { removeSessionRefs as removeSessionMediaRefs } from './cindy-media/ledger';
 import { createStorageIpcHandlers } from './cindy-media/storageIpc';
 import {
   getAllRegisteredDraftUrls,
@@ -251,6 +250,7 @@ import { fetchReleaseNotes, fetchReleaseNotesIndex } from './releaseNotesService
 import { resolveWorkspacePathCached, resolveWorkspacePathBatchCached } from './pathResolver';
 import { registerLocalDbIpc } from './localDb/ipc/registerAll';
 import { listPersistedChatAttachmentPaths } from './localDb/ipc/messages';
+import { finalizeDeletedSessionLifecycle } from './localDb/ipc/sessions';
 import {
   registerLegacyMigrationIpc,
   runLegacyUserDataMigrationForUser,
@@ -5647,22 +5647,13 @@ const registerIpcHandlers = () => {
     },
   );
 
-  // F7: cleanup an entire session's cache directory (delete session)
+  // F7 compatibility channel: cleanup is owned by the Main session lifecycle.
+  // Re-checking status here prevents stale renderer calls from destroying an
+  // active/restored session.
   ipcMain.handle(
     'image-cache:cleanup-session',
     async (_event: Electron.IpcMainInvokeEvent, sessionId: string): Promise<void> => {
-      await imageCacheStore.removeSession(sessionId);
-      // 媒体总仓对应清理:删本会话名下的媒体引用行(附件/导入/
-      // 消息出生引用;画廊等持久引用不动)。失败只警告——引用行残留是
-      // 无害的保守方向(blob 多活一阵),由对账工具兜底,不阻塞会话删除。
-      try {
-        await removeSessionMediaRefs(sessionId);
-      } catch (err) {
-        createLogger('image-cache').warn('session media ref cleanup failed', {
-          sessionId,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
+      await finalizeDeletedSessionLifecycle(sessionId);
     },
   );
 

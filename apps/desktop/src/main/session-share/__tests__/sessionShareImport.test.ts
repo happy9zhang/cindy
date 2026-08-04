@@ -26,7 +26,13 @@ const dbMock = vi.hoisted(() => ({
   txError: null as Error | null,
 }));
 const patchMock = vi.hoisted(() => ({
-  calls: [] as Array<{ sessionId: string; patch: Record<string, unknown> }>,
+  calls: [] as Array<{
+    sessionId: string;
+    patch: Record<string, unknown>;
+    options?: Record<string, unknown>;
+  }>,
+  finalizeCalls: [] as string[],
+  finalizeError: null as Error | null,
 }));
 const codexMock = vi.hoisted(() => ({
   importCalls: [] as unknown[],
@@ -160,9 +166,17 @@ vi.mock('../../worktree/WorktreeManager.js', () => ({
 }));
 // 覆盖导入的软删/恢复走 patchSessionMetaInDb(真实实现依赖 Electron 主进程环境)
 vi.mock('../../localDb/ipc/sessions.js', () => ({
-  patchSessionMetaInDb: async (sessionId: string, patch: Record<string, unknown>) => {
-    patchMock.calls.push({ sessionId, patch });
+  patchSessionMetaInDb: async (
+    sessionId: string,
+    patch: Record<string, unknown>,
+    options?: Record<string, unknown>,
+  ) => {
+    patchMock.calls.push({ sessionId, patch, ...(options ? { options } : {}) });
     return { id: sessionId, ...patch };
+  },
+  finalizeDeletedSessionLifecycle: async (sessionId: string) => {
+    patchMock.finalizeCalls.push(sessionId);
+    if (patchMock.finalizeError) throw patchMock.finalizeError;
   },
 }));
 
@@ -329,6 +343,8 @@ describe('sessionShareImport', () => {
     dbMock.txCalls = [];
     dbMock.txError = null;
     patchMock.calls = [];
+    patchMock.finalizeCalls = [];
+    patchMock.finalizeError = null;
     codexMock.importCalls = [];
     codexMock.removeCalls = [];
     cindyMediaMock.ingestCalls = [];
@@ -600,8 +616,13 @@ describe('sessionShareImport', () => {
     expect(result.sessionId).toBeTruthy();
     // 旧会话被软删(覆盖 = 替换而非叠加),新会话行正常落库
     expect(patchMock.calls).toEqual([
-      { sessionId: 'existing-session', patch: { status: 'deleted' } },
+      {
+        sessionId: 'existing-session',
+        patch: { status: 'deleted' },
+        options: { deferDeletedLifecycle: true },
+      },
     ]);
+    expect(patchMock.finalizeCalls).toEqual(['existing-session']);
     expect(dbMock.txCalls).toHaveLength(1);
   });
 
@@ -622,10 +643,42 @@ describe('sessionShareImport', () => {
     ).rejects.toMatchObject({ code: 'SHARE_IMPORT_FAILED' });
     // 逆序回滚把旧会话恢复回原 status(archived 不误恢复成 active),不丢用户数据
     expect(patchMock.calls).toEqual([
-      { sessionId: 'existing-session', patch: { status: 'deleted' } },
+      {
+        sessionId: 'existing-session',
+        patch: { status: 'deleted' },
+        options: { deferDeletedLifecycle: true },
+      },
       { sessionId: 'existing-session', patch: { status: 'archived' } },
     ]);
+    expect(patchMock.finalizeCalls).toHaveLength(0);
     expect(dbMock.txCalls).toHaveLength(0);
+  });
+
+  it('overwrite stays committed when best-effort cleanup fails after the new row lands', async () => {
+    dbMock.conflictRow = { id: 'existing-session', status: 'active' };
+    patchMock.finalizeError = new Error('cleanup unavailable');
+    const filePath = await writeBundleFile(await buildBundle());
+    const inspect = await inspectShareFile(filePath);
+    if (inspect.encrypted) return;
+
+    await expect(
+      commitShareImport({
+        draftId: inspect.draftId,
+        workingDir: newWorkdir,
+        projectsRootOverride: projectsRoot,
+        overwrite: true,
+      }),
+    ).resolves.toMatchObject({ sessionId: expect.any(String) });
+
+    expect(patchMock.calls).toEqual([
+      {
+        sessionId: 'existing-session',
+        patch: { status: 'deleted' },
+        options: { deferDeletedLifecycle: true },
+      },
+    ]);
+    expect(patchMock.finalizeCalls).toEqual(['existing-session']);
+    expect(dbMock.txCalls).toHaveLength(1);
   });
 
   it('overwrite flag is a no-op when there is no conflict', async () => {
@@ -641,6 +694,7 @@ describe('sessionShareImport', () => {
     });
     expect(result.sessionId).toBeTruthy();
     expect(patchMock.calls).toHaveLength(0);
+    expect(patchMock.finalizeCalls).toHaveLength(0);
     expect(dbMock.txCalls).toHaveLength(1);
   });
 

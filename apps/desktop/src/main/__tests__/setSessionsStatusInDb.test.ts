@@ -222,6 +222,6 @@ describe('setSessionsStatusInDb', () => {
     const batchBody = source.match(
       /export async function setSessionsStatusInDb[\s\S]*return applied\.map/,
     )?.[0];
-    expect(batchBody).toContain('scheduleWorktreeRecycleForStatusChange(item.sessionId, item.status)');
+    expect(batchBody).toContain('applySessionStatusLifecycle(item.sessionId, item.status, item.workingDir)');
   });
 });

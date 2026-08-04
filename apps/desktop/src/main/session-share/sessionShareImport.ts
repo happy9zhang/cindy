@@ -19,7 +19,10 @@ import { app } from 'electron';
 
 import { getDbClient } from '../localDb/client/current.js';
 import { ensureDialogueWorkspaceDir } from '../localDb/dialogueWorkspace.js';
-import { patchSessionMetaInDb } from '../localDb/ipc/sessions.js';
+import {
+  finalizeDeletedSessionLifecycle,
+  patchSessionMetaInDb,
+} from '../localDb/ipc/sessions.js';
 import { createLogger } from '../logger.js';
 import {
   importSharedCodexThread,
@@ -365,12 +368,16 @@ export async function commitShareImport(
   };
 
   try {
-    // 0. 覆盖导入:软删旧会话(复用手动删除的完整语义——DB 更新 + 图片缓存清理 +
-    //    sessions:patched 广播,sidebar 即时移除),并登记 journal 恢复原 status:
-    //    后续任一步失败逆序回滚时旧会话回到列表,不丢用户数据。
+    // 0. 覆盖导入:先只把旧会话隐藏,暂缓所有不可逆资源清理。新会话事务提交
+    //    后才 finalise 旧会话；后续任一步失败时 journal 恢复原 status,图片、
+    //    媒体引用、WeChat 附件、hook 与 worktree 都仍完整可用。
     if (conflictExisting) {
       const { id: existingId, status: prevStatus } = conflictExisting;
-      await patchSessionMetaInDb(existingId, { status: 'deleted' });
+      await patchSessionMetaInDb(
+        existingId,
+        { status: 'deleted' },
+        { deferDeletedLifecycle: true },
+      );
       journal.push(async () => {
         await patchSessionMetaInDb(existingId, {
           status: prevStatus === 'archived' ? 'archived' : 'active',
@@ -595,6 +602,16 @@ export async function commitShareImport(
       notes,
     });
     drafts.delete(opts.draftId);
+    // 新会话已落库、结果也已完成构造,覆盖操作至此不可再进入任何可逆步骤。
+    // 统一 finalizer 内部会再次确认旧行仍为 deleted，并对各资源族做故障隔离。
+    if (conflictExisting) {
+      await finalizeDeletedSessionLifecycle(conflictExisting.id).catch((err) => {
+        log.warn('share import overwrite cleanup failed', {
+          existingId: conflictExisting.id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+    }
     return { sessionId: newId, fidelity, notes };
   } catch (err) {
     await rollback();

@@ -23,6 +23,7 @@ const h = vi.hoisted(() => ({
   })),
   tapWindowBroadcast: vi.fn(),
   summarizeSession: vi.fn(async () => undefined),
+  cleanupDeletedSessionResources: vi.fn(async () => undefined),
 }));
 
 vi.mock('electron', () => ({
@@ -31,19 +32,38 @@ vi.mock('electron', () => ({
       h.handlers.set(channel, handler);
     }),
   },
+  app: { getPath: () => '/tmp/cindy-sessions-update-test' },
   BrowserWindow: { getAllWindows: () => [] },
 }));
 vi.mock('../../../logger', () => ({
   createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
 }));
 vi.mock('../../client/current', () => ({
-  getDbClient: () => ({ drizzle: h.db }),
+  getDbClient: () => ({
+    drizzle: h.db,
+    queryOne: async (_sql: string, params: unknown[]) =>
+      h.sqlite!
+        .prepare('SELECT status FROM sessions WHERE id = ? LIMIT 1')
+        .get(params[0]) as { status: string } | undefined,
+  }),
 }));
 vi.mock('../../dialogueWorkspace', () => ({ ensureDialogueWorkspaceDir: vi.fn() }));
 vi.mock('../../../git-context/prRefsStore', () => ({
   recomputePrRefsForSession: vi.fn(async () => undefined),
 }));
-vi.mock('../../../imageCacheStore', () => ({ removeSession: vi.fn(async () => undefined) }));
+vi.mock('../../../sessionDeletionCleanup', () => ({
+  cleanupDeletedSessionResources: h.cleanupDeletedSessionResources,
+}));
+vi.mock('../../../maker-host/index.js', () => ({
+  getMakerIfReady: () => null,
+}));
+vi.mock('../../../worktree/sessionRemovalRecycle.js', () => ({
+  isSessionStillRemovable: vi.fn(async () => false),
+  recycleWorktreeForRemovedSession: vi.fn(async () => undefined),
+}));
+vi.mock('../../../maker-ipc/register.js', () => ({
+  withSendToSessionLock: async (_sessionId: string, run: () => Promise<void>) => run(),
+}));
 vi.mock('../recentWorkdirs', () => ({ upsertRecentWorkdir: vi.fn(async () => undefined) }));
 vi.mock('../../../device-link/broadcast-tap.js', () => ({
   getSafeDataOwnerPushStamp: vi.fn(() => undefined),
@@ -59,7 +79,11 @@ vi.mock('../../../maker-host/claude-transcript-relocation.js', () => ({
   relocateClaudeTranscriptsForSessionMove: h.relocate,
 }));
 
-import { registerSessionIpc } from '../sessions';
+import {
+  finalizeDeletedSessionLifecycle,
+  patchSessionMetaInDb,
+  registerSessionIpc,
+} from '../sessions';
 
 function createDb(): void {
   const sqlite = new Database(':memory:');
@@ -136,6 +160,12 @@ function createDb(): void {
 async function invokeUpdate(id: string, patch: Record<string, unknown>): Promise<unknown> {
   const handler = h.handlers.get('local-db:sessions:update');
   if (!handler) throw new Error('update handler not registered');
+  return handler({}, id, patch);
+}
+
+async function invokePatchMeta(id: string, patch: Record<string, unknown>): Promise<unknown> {
+  const handler = h.handlers.get('local-db:sessions:patch-meta');
+  if (!handler) throw new Error('patch-meta handler not registered');
   return handler({}, id, patch);
 }
 
@@ -284,5 +314,44 @@ describe('local-db:sessions:update handler wiring', () => {
   it('does nothing for remote sessions', async () => {
     await invokeUpdate('cc-remote', { workingDir: '/new/dir' });
     expect(h.relocate).not.toHaveBeenCalled();
+  });
+
+  it('routes local and remote permanent deletion through the same Main cleanup', async () => {
+    await invokeUpdate('cc-local', { status: 'deleted' });
+    await vi.waitFor(() => {
+      expect(h.cleanupDeletedSessionResources).toHaveBeenCalledWith('cc-local');
+    });
+
+    h.cleanupDeletedSessionResources.mockClear();
+    await invokePatchMeta('cc-remote', { status: 'deleted' });
+    await vi.waitFor(() => {
+      expect(h.cleanupDeletedSessionResources).toHaveBeenCalledWith('cc-remote');
+    });
+  });
+
+  it('does not run permanent resource cleanup for archive', async () => {
+    await invokeUpdate('cc-local', { status: 'archived' });
+    await vi.dynamicImportSettled();
+    expect(h.cleanupDeletedSessionResources).not.toHaveBeenCalled();
+  });
+
+  it('skips a stale compatibility cleanup call after the session is active again', async () => {
+    await finalizeDeletedSessionLifecycle('cc-local');
+    expect(h.cleanupDeletedSessionResources).not.toHaveBeenCalled();
+  });
+
+  it('can hide an overwrite target without starting irreversible cleanup', async () => {
+    await patchSessionMetaInDb(
+      'cc-local',
+      { status: 'deleted' },
+      { deferDeletedLifecycle: true },
+    );
+    await vi.dynamicImportSettled();
+
+    const row = h.sqlite!
+      .prepare('SELECT status FROM sessions WHERE id = ?')
+      .get('cc-local') as { status: string };
+    expect(row.status).toBe('deleted');
+    expect(h.cleanupDeletedSessionResources).not.toHaveBeenCalled();
   });
 });

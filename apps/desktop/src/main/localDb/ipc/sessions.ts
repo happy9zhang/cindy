@@ -30,11 +30,9 @@ import { ensureDialogueWorkspaceDir } from '../dialogueWorkspace';
 import { recomputePrRefsForSession } from '../../git-context/prRefsStore';
 import { ensureProjectGitInitialized } from '../../git-snapshot/projectGitBootstrap';
 import { readGitSafetySettings } from '../../maker-host/git-safety-settings-store';
-import * as imageCacheStore from '../../imageCacheStore';
-import { removeSessionRefs as removeSessionMediaRefs } from '../../cindy-media/ledger';
-import { removeWechatSessionAttachmentDir } from '../../im/wechat/mediaStaging';
 import { upsertRecentWorkdir } from './recentWorkdirs';
 import { createLogger } from '../../logger';
+import { cleanupDeletedSessionResources } from '../../sessionDeletionCleanup';
 import { DESKTOP_VISIBLE_SESSION_SOURCES } from '../../../shared/sessionSource.js';
 import { normalizeWorkingDirForStorage } from '../../../shared/workingDir.js';
 import type { SessionReference } from '../../../shared/sessionReference.js';
@@ -52,10 +50,8 @@ import {
 } from '../sessionActiveTurn';
 import {
   dismissErrorMessage,
-  listDeletableSessionPersistedChatAttachmentPaths,
   rebroadcastAgentSwitchBoundary,
 } from './messages';
-import { cleanupStagedChatAttachments } from '../../file-browser/remote-file-cache';
 import { assertTrustedAppRendererEvent } from '../../security/trustedAppRenderer.js';
 
 const log = createLogger('sessions');
@@ -211,6 +207,52 @@ function notifyGhostSessionStatusChange(
       }),
     )
     .catch(() => {});
+}
+
+/**
+ * Finish the irreversible side effects of a permanent session deletion.
+ *
+ * Status is re-read before touching files or media refs so compatibility IPC
+ * calls and deferred share-import cleanup cannot destroy a session that has
+ * already been restored. The individual resource families are best-effort;
+ * startup reconciliation remains the fallback for worktrees and media GC.
+ */
+export async function finalizeDeletedSessionLifecycle(sessionId: string): Promise<void> {
+  let current: { status: string } | undefined;
+  try {
+    current = await getDbClient().queryOne<{ status: string }>(
+      'SELECT status FROM sessions WHERE id = ? LIMIT 1',
+      [sessionId],
+    );
+  } catch (err) {
+    log.warn('deleted session lifecycle status check failed', {
+      sessionId,
+      err: err instanceof Error ? err.message : String(err),
+    });
+    return;
+  }
+  if (current?.status !== 'deleted') return;
+
+  removeHookAttachmentDir(sessionId, 'deleted');
+  scheduleWorktreeRecycleForStatusChange(sessionId, 'deleted');
+  await cleanupDeletedSessionResources(sessionId);
+}
+
+function applySessionStatusLifecycle(
+  sessionId: string,
+  status: unknown,
+  workingDir?: string | null,
+  options: { deferDeletedLifecycle?: boolean } = {},
+): void {
+  notifyGhostSessionStatusChange(sessionId, status, workingDir);
+  if (status === 'deleted') {
+    if (!options.deferDeletedLifecycle) {
+      void finalizeDeletedSessionLifecycle(sessionId);
+    }
+    return;
+  }
+  scheduleWorktreeRecycleForStatusChange(sessionId, status);
+  removeHookAttachmentDir(sessionId, status);
 }
 
 /** device-link 远程 set-* 回流可持久化的 session settings 字段(见 persistSessionFields)。 */
@@ -1344,9 +1386,7 @@ export function registerSessionIpc(
       workingDir: updated.workingDir,
       workspaceKind: updated.workspaceKind,
     });
-    scheduleWorktreeRecycleForStatusChange(sid, p.status);
-    notifyGhostSessionStatusChange(sid, p.status, updated.workingDir);
-    removeHookAttachmentDir(sid, p.status);
+    applySessionStatusLifecycle(sid, p.status, updated.workingDir);
     return updated;
   });
 
@@ -1388,6 +1428,7 @@ export async function patchSessionMetaInDb(
     title?: string;
     pinnedAt?: string | null;
   },
+  options: { deferDeletedLifecycle?: boolean } = {},
 ): Promise<ReturnType<typeof sessionToCamel>> {
   const ownerScope = captureOwnerScope();
   for (const k of Object.keys(patch)) {
@@ -1421,44 +1462,7 @@ export async function patchSessionMetaInDb(
     workingDir: updated.workingDir,
     workspaceKind: updated.workspaceKind,
   });
-  if (patch.status === 'deleted') {
-    void imageCacheStore.removeSession(sessionId).catch((err) => {
-      log.warn('remote session image cleanup failed', {
-        sessionId,
-        err: err instanceof Error ? err.message : String(err),
-      });
-    });
-    // 媒体总仓对应清理:删本会话名下的媒体引用行(附件/导入/
-    // 消息出生引用;画廊等持久引用不动),引用归零的 blob 交回收器。
-    // fire-and-forget 与历史目录清理同语义:失败只警告,不阻塞删除。
-    void removeSessionMediaRefs(sessionId)
-      .then((n) => {
-        if (n > 0) log.info('session media refs removed', { sessionId, count: n });
-      })
-      .catch((err) => {
-        log.warn('session media ref cleanup failed', {
-          sessionId,
-          err: err instanceof Error ? err.message : String(err),
-        });
-      });
-    void removeWechatSessionAttachmentDir(sessionId).catch((err) => {
-      log.warn('WeChat session attachment cleanup failed', {
-        sessionId,
-        err: err instanceof Error ? err.message : String(err),
-      });
-    });
-    void listDeletableSessionPersistedChatAttachmentPaths(sessionId)
-      .then((filePaths) => cleanupStagedChatAttachments(filePaths))
-      .catch((err) => {
-        log.warn('staged chat attachment cleanup failed', {
-          sessionId,
-          err: err instanceof Error ? err.message : String(err),
-        });
-      });
-  }
-  removeHookAttachmentDir(sessionId, patch.status);
-  scheduleWorktreeRecycleForStatusChange(sessionId, patch.status);
-  notifyGhostSessionStatusChange(sessionId, patch.status, updated.workingDir);
+  applySessionStatusLifecycle(sessionId, patch.status, updated.workingDir, options);
   // 远程 / MCP 改动绕过 renderer 乐观更新,故主动广播 sessions:patched:
   //   - sessionsStore.onPatched → patchLocal,即时反映到 sidebar(删/归档移出 active 桶、改名/置顶刷新);
   //   - CCAgentSessionView.onPatched → 合并进 serverSession。
@@ -1601,9 +1605,7 @@ export async function setSessionsStatusInDb(
       workspaceKind: item.workspaceKind,
     });
     broadcastSessionPatched(item.sessionId, { status: item.status }, ownerScope);
-    scheduleWorktreeRecycleForStatusChange(item.sessionId, item.status);
-    notifyGhostSessionStatusChange(item.sessionId, item.status, item.workingDir);
-    removeHookAttachmentDir(item.sessionId, item.status);
+    applySessionStatusLifecycle(item.sessionId, item.status, item.workingDir);
   }
   return applied.map((item) => ({
     sessionId: item.sessionId,
